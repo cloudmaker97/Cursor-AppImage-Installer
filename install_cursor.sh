@@ -82,11 +82,11 @@ find_desktop_file() {
         mapfile -t desktop_files < <(find squashfs-root -name "*.desktop" -type f 2>/dev/null)
         if [[ ${#desktop_files[@]} -gt 0 ]]; then
             desktop_source="${desktop_files[0]}"
-            log_warn "Using desktop file: $desktop_source"
+            log_warn "Using desktop file: $desktop_source" >&2  # Send log to stderr
         fi
     fi
 
-    echo "$desktop_source"
+    echo "$desktop_source"  # Only output the path
 }
 
 # Find icon file in extracted AppImage
@@ -107,7 +107,7 @@ find_icon_file() {
     for icon in "${possible_icons[@]}"; do
         if [[ -f "$icon" ]]; then
             icon_source="$icon"
-            log_info "Found icon: $icon"
+            log_info "Found icon: $icon" >&2  # Send log to stderr
             break
         fi
     done
@@ -118,11 +118,11 @@ find_icon_file() {
         mapfile -t icon_files < <(find squashfs-root -name "*.png" -o -name "*.svg" -o -name "*.ico" 2>/dev/null | head -5)
         if [[ ${#icon_files[@]} -gt 0 ]]; then
             icon_source="${icon_files[0]}"
-            log_warn "Using icon file: $icon_source"
+            log_warn "Using icon file: $icon_source" >&2  # Send log to stderr
         fi
     fi
 
-    echo "$icon_source"
+    echo "$icon_source"  # Only output the path
 }
 
 # Install icon to permanent location
@@ -136,20 +136,20 @@ install_icon() {
         local icon_filename="cursor.png"
         icon_dest="$icon_dir/$icon_filename"
         cp "$icon_source" "$icon_dest"
-        log_info "Icon copied from: $icon_source"
-        log_info "Icon installed to: $icon_dest"
+        log_info "Icon copied from: $icon_source" >&2  # Send log to stderr
+        log_info "Icon installed to: $icon_dest" >&2   # Send log to stderr
 
         # Verify icon was copied successfully
         if [[ -f "$icon_dest" ]]; then
-            log_info "Icon installation verified ✓"
+            log_info "Icon installation verified ✓" >&2  # Send log to stderr
         else
-            log_warn "Icon copy failed!"
+            log_warn "Icon copy failed!" >&2  # Send log to stderr
         fi
     else
-        log_warn "No icon found in AppImage"
+        log_warn "No icon found in AppImage" >&2  # Send log to stderr
     fi
 
-    echo "$icon_dest"
+    echo "$icon_dest"  # Only output the path
 }
 
 # Create or update desktop file
@@ -182,10 +182,22 @@ EOF
     # Update desktop file with correct paths and add sandbox flag
     sed -i "s|Exec=.*|Exec=\"$appimage_full_path\" --no-sandbox|g" "$desktop_dest"
 
+    # Handle icon - always replace with our installed icon path if we have one
     if [[ -n "$icon_dest" ]]; then
-        # Don't add quotes around the icon path - desktop files don't need them
-        sed -i "s|Icon=.*|Icon=$icon_dest|g" "$desktop_dest"
+        # Replace any existing Icon line or add one if missing
+        if grep -q "^Icon=" "$desktop_dest"; then
+            sed -i "s|Icon=.*|Icon=$icon_dest|g" "$desktop_dest"
+        else
+            # Add Icon line after Name line
+            sed -i "/^Name=/a Icon=$icon_dest" "$desktop_dest"
+        fi
         log_info "Desktop file icon set to: $icon_dest"
+        
+        # Also handle the Desktop Action section if it exists
+        if grep -q "^\[Desktop Action" "$desktop_dest"; then
+            # Replace Icon in action sections too
+            sed -i "/^\[Desktop Action/,/^\[/ { /^Icon=/c\\Icon=$icon_dest ; }" "$desktop_dest"
+        fi
     else
         # Remove icon line if no icon found
         sed -i "/^Icon=/d" "$desktop_dest"
