@@ -122,13 +122,24 @@ EOF
     # Find icon file
     local icon_source=""
     local possible_icons=(
+        "squashfs-root/co.anysphere.cursor.png"
         "squashfs-root/cursor.png"
         "squashfs-root/resources/app/build/icon.png"
         "squashfs-root/usr/share/icons/hicolor/512x512/apps/cursor.png"
+        "squashfs-root/usr/share/icons/hicolor/512x512/apps/co.anysphere.cursor.png"
         "squashfs-root/usr/share/pixmaps/cursor.png"
+        "squashfs-root/usr/share/pixmaps/co.anysphere.cursor.png"
         "squashfs-root/icon.png"
         "squashfs-root/app.png"
     )
+    
+    for icon in "${possible_icons[@]}"; do
+        if [[ -f "$icon" ]]; then
+            icon_source="$icon"
+            log_info "Found icon: $icon"
+            break
+        fi
+    done
     
     for icon in "${possible_icons[@]}"; do
         if [[ -f "$icon" ]]; then
@@ -171,18 +182,38 @@ EOF
         local icon_filename="cursor.png"
         icon_dest="$icon_dir/$icon_filename"
         cp "$icon_source" "$icon_dest"
+        log_info "Icon copied from: $icon_source"
         log_info "Icon installed to: $icon_dest"
+        
+        # Verify icon was copied successfully
+        if [[ -f "$icon_dest" ]]; then
+            log_info "Icon installation verified ✓"
+        else
+            log_warn "Icon copy failed!"
+        fi
+    else
+        log_warn "No icon found in AppImage"
     fi
     
     # Update desktop file with correct paths and add sandbox flag
     sed -i "s|Exec=.*|Exec=\"$appimage_full_path\" --no-sandbox|g" "$desktop_dest"
     
     if [[ -n "$icon_dest" ]]; then
-        sed -i "s|Icon=.*|Icon=\"$icon_dest\"|g" "$desktop_dest"
+        # Don't add quotes around the icon path - desktop files don't need them
+        sed -i "s|Icon=.*|Icon=$icon_dest|g" "$desktop_dest"
+        log_info "Desktop file icon set to: $icon_dest"
     else
         # Remove icon line if no icon found
         sed -i "/^Icon=/d" "$desktop_dest"
+        log_warn "No icon found - removed Icon line from desktop file"
     fi
+    
+    # Show the final desktop file content for verification
+    echo ""
+    log_info "Final desktop file content:"
+    echo "─────────────────────────────────────"
+    cat "$desktop_dest"
+    echo "─────────────────────────────────────"
     
     # Make desktop file executable
     chmod +x "$desktop_dest"
