@@ -1,0 +1,317 @@
+name: Bash Script Quality Check
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.sh'
+      - '.github/workflows/bash-check.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.sh'
+      - '.github/workflows/bash-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bash-check:
+    runs-on: ubuntu-latest
+    name: Bash Script Analysis
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install analysis tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck bats
+        
+        # Install additional tools
+        wget -qO- "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz" | tar -xJv
+        sudo cp "shellcheck-stable/shellcheck" /usr/bin/
+        
+        # Install shfmt for formatting checks
+        GO_VERSION="1.21.0"
+        wget -q "https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+        sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
+        export PATH="/usr/local/go/bin:$PATH"
+        go install mvdan.cc/sh/v3/cmd/shfmt@latest
+        sudo cp "$(go env GOPATH)/bin/shfmt" /usr/bin/
+        
+    - name: Find bash scripts
+      id: find-scripts
+      run: |
+        echo "Finding bash scripts..."
+        
+        # Find all .sh files and files with bash shebang
+        SCRIPT_FILES=""
+        
+        # Find .sh files
+        if find . -name "*.sh" -type f | head -1 > /dev/null 2>&1; then
+          SCRIPT_FILES="$(find . -name "*.sh" -type f)"
+        fi
+        
+        # Find files with bash shebang
+        SHEBANG_FILES="$(find . -type f -exec grep -l '^#!/.*bash' {} \; 2>/dev/null || true)"
+        
+        # Combine and deduplicate
+        ALL_SCRIPTS="$(echo -e "$SCRIPT_FILES\n$SHEBANG_FILES" | sort -u | grep -v '^$' || true)"
+        
+        if [ -z "$ALL_SCRIPTS" ]; then
+          echo "No bash scripts found"
+          echo "scripts_found=false" >> $GITHUB_OUTPUT
+        else
+          echo "Found scripts:"
+          echo "$ALL_SCRIPTS"
+          echo "scripts_found=true" >> $GITHUB_OUTPUT
+          # Save scripts list for later steps
+          echo "$ALL_SCRIPTS" > scripts_list.txt
+        fi
+        
+    - name: Check script permissions
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      run: |
+        echo "## 🔒 Script Permissions Check" >> $GITHUB_STEP_SUMMARY
+        echo "| Script | Permissions | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------------|---------|" >> $GITHUB_STEP_SUMMARY
+        
+        PERMISSION_ISSUES=0
+        while IFS= read -r script; do
+          if [ -f "$script" ]; then
+            PERMS=$(stat -c "%a" "$script")
+            if [ "$PERMS" = "755" ] || [ "$PERMS" = "775" ] || [ "$PERMS" = "700" ]; then
+              echo "| $script | $PERMS | ✅ Good |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| $script | $PERMS | ⚠️ Should be executable |" >> $GITHUB_STEP_SUMMARY
+              PERMISSION_ISSUES=$((PERMISSION_ISSUES + 1))
+            fi
+          fi
+        done < scripts_list.txt
+        
+        if [ $PERMISSION_ISSUES -gt 0 ]; then
+          echo ""
+          echo "⚠️ $PERMISSION_ISSUES script(s) may need executable permissions"
+          echo "Consider running: chmod +x script-name.sh"
+        fi
+        
+    - name: ShellCheck analysis
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      continue-on-error: true
+      run: |
+        echo "## 🔍 ShellCheck Analysis" >> $GITHUB_STEP_SUMMARY
+        
+        SHELLCHECK_ISSUES=0
+        TOTAL_SCRIPTS=0
+        
+        while IFS= read -r script; do
+          if [ -f "$script" ]; then
+            TOTAL_SCRIPTS=$((TOTAL_SCRIPTS + 1))
+            echo "Checking $script..."
+            
+            if shellcheck -f gcc "$script" > "shellcheck_${script//\//_}.log" 2>&1; then
+              echo "✅ $script - No issues found"
+            else
+              SHELLCHECK_ISSUES=$((SHELLCHECK_ISSUES + 1))
+              echo "❌ $script - Issues found"
+              
+              # Add detailed output to summary
+              echo "<details>" >> $GITHUB_STEP_SUMMARY
+              echo "<summary>❌ Issues in $script</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat "shellcheck_${script//\//_}.log" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        done < scripts_list.txt
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Summary:** $((TOTAL_SCRIPTS - SHELLCHECK_ISSUES))/$TOTAL_SCRIPTS scripts passed ShellCheck" >> $GITHUB_STEP_SUMMARY
+        
+        # Set output for later use
+        echo "shellcheck_issues=$SHELLCHECK_ISSUES" >> $GITHUB_OUTPUT
+        
+    - name: Format check with shfmt
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      continue-on-error: true
+      run: |
+        echo "## 📝 Format Check (shfmt)" >> $GITHUB_STEP_SUMMARY
+        
+        FORMAT_ISSUES=0
+        
+        while IFS= read -r script; do
+          if [ -f "$script" ]; then
+            echo "Checking format of $script..."
+            
+            if shfmt -d -i 4 -ci "$script" > "format_${script//\//_}.diff" 2>&1; then
+              echo "✅ $script - Properly formatted"
+            else
+              FORMAT_ISSUES=$((FORMAT_ISSUES + 1))
+              echo "❌ $script - Format issues found"
+              
+              # Add diff to summary if it's not too large
+              DIFF_SIZE=$(wc -c < "format_${script//\//_}.diff")
+              if [ "$DIFF_SIZE" -lt 2000 ]; then
+                echo "<details>" >> $GITHUB_STEP_SUMMARY
+                echo "<summary>📝 Format suggestions for $script</summary>" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo '```diff' >> $GITHUB_STEP_SUMMARY
+                cat "format_${script//\//_}.diff" >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                echo "</details>" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "❌ $script - Format diff too large to display" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+        done < scripts_list.txt
+        
+        if [ $FORMAT_ISSUES -gt 0 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Tip:** Run \`shfmt -w -i 4 -ci *.sh\` to auto-format scripts" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+    - name: Bash syntax check
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      run: |
+        echo "## ✅ Bash Syntax Check" >> $GITHUB_STEP_SUMMARY
+        
+        SYNTAX_ERRORS=0
+        
+        while IFS= read -r script; do
+          if [ -f "$script" ]; then
+            echo "Checking syntax of $script..."
+            
+            if bash -n "$script" 2> "syntax_${script//\//_}.log"; then
+              echo "✅ $script - Syntax OK"
+              echo "| $script | ✅ Valid | No errors |" >> $GITHUB_STEP_SUMMARY
+            else
+              SYNTAX_ERRORS=$((SYNTAX_ERRORS + 1))
+              echo "❌ $script - Syntax errors found"
+              echo "| $script | ❌ Invalid | $(cat "syntax_${script//\//_}.log" | head -1) |" >> $GITHUB_STEP_SUMMARY
+              
+              # Show full error in details
+              echo "<details>" >> $GITHUB_STEP_SUMMARY
+              echo "<summary>❌ Syntax errors in $script</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat "syntax_${script//\//_}.log" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        done < scripts_list.txt
+        
+        if [ $SYNTAX_ERRORS -gt 0 ]; then
+          echo "❌ Found $SYNTAX_ERRORS script(s) with syntax errors"
+          exit 1
+        else
+          echo "✅ All scripts have valid bash syntax"
+        fi
+        
+    - name: Security scan with custom rules
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      continue-on-error: true
+      run: |
+        echo "## 🔒 Security Scan" >> $GITHUB_STEP_SUMMARY
+        echo "| Script | Issue | Severity | Line |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|--------|----------|------|" >> $GITHUB_STEP_SUMMARY
+        
+        SECURITY_ISSUES=0
+        
+        while IFS= read -r script; do
+          if [ -f "$script" ]; then
+            echo "Security scanning $script..."
+            
+            # Check for common security issues
+            LINE_NUM=1
+            while IFS= read -r line; do
+              # Check for dangerous patterns
+              if echo "$line" | grep -q "eval.*\$"; then
+                echo "| $script | eval with variable | ⚠️ Medium | $LINE_NUM |" >> $GITHUB_STEP_SUMMARY
+                SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+              fi
+              
+              if echo "$line" | grep -q "curl.*|.*sh"; then
+                echo "| $script | Pipe curl to shell | 🔥 High | $LINE_NUM |" >> $GITHUB_STEP_SUMMARY
+                SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+              fi
+              
+              if echo "$line" | grep -q "wget.*|.*sh"; then
+                echo "| $script | Pipe wget to shell | 🔥 High | $LINE_NUM |" >> $GITHUB_STEP_SUMMARY
+                SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+              fi
+              
+              if echo "$line" | grep -q "rm.*-rf.*\$"; then
+                echo "| $script | rm -rf with variable | ⚠️ Medium | $LINE_NUM |" >> $GITHUB_STEP_SUMMARY
+                SECURITY_ISSUES=$((SECURITY_ISSUES + 1))
+              fi
+              
+              LINE_NUM=$((LINE_NUM + 1))
+            done < "$script"
+          fi
+        done < scripts_list.txt
+        
+        if [ $SECURITY_ISSUES -eq 0 ]; then
+          echo "| - | No security issues found | ✅ Good | - |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+    - name: Create comment for PR
+      if: github.event_name == 'pull_request' && steps.find-scripts.outputs.scripts_found == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Create a comment with the analysis results
+          const fs = require('fs');
+          
+          let comment = `## 🔍 Bash Script Analysis Results\n\n`;
+          comment += `This PR contains bash scripts that have been automatically analyzed.\n\n`;
+          comment += `### 📊 Summary\n`;
+          comment += `- **ShellCheck**: Analysis completed\n`;
+          comment += `- **Syntax Check**: All scripts validated\n`;
+          comment += `- **Format Check**: Style analysis completed\n`;
+          comment += `- **Security Scan**: Common issues checked\n\n`;
+          comment += `### 💡 Recommendations\n`;
+          comment += `- Review any ShellCheck warnings above\n`;
+          comment += `- Consider running \`shfmt -w -i 4 -ci *.sh\` for consistent formatting\n`;
+          comment += `- Test scripts in a safe environment before merging\n\n`;
+          comment += `<sub>🤖 This comment was automatically generated by the Bash Script Quality Check workflow</sub>`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+          
+    - name: Upload analysis artifacts
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: bash-analysis-results
+        path: |
+          *.log
+          *.diff
+          scripts_list.txt
+        retention-days: 30
+        
+    - name: Final status
+      if: steps.find-scripts.outputs.scripts_found == 'true'
+      run: |
+        echo "## 🎯 Final Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ Bash script analysis completed successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Review any ShellCheck warnings" >> $GITHUB_STEP_SUMMARY
+        echo "2. Fix syntax errors if any" >> $GITHUB_STEP_SUMMARY
+        echo "3. Consider format improvements" >> $GITHUB_STEP_SUMMARY
+        echo "4. Address security concerns" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "💡 **Pro tip**: Add \`# shellcheck disable=SC2034\` comments to suppress false positives"
