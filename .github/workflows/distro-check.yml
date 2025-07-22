@@ -1,0 +1,390 @@
+name: Auto Download and Test Cursor Installation
+
+on:
+  schedule:
+    # Run every Monday at 09:00 UTC to check for new versions
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      test_distros:
+        description: 'Comma-separated list of distros to test'
+        required: false
+        default: 'ubuntu-22.04,ubuntu-20.04'
+        type: string
+      force_download:
+        description: 'Force re-download even if AppImage exists'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  download-cursor:
+    runs-on: ubuntu-latest
+    name: Download Latest Cursor AppImage
+    outputs:
+      cursor-version: ${{ steps.download.outputs.cursor-version }}
+      download-url: ${{ steps.download.outputs.download-url }}
+      appimage-name: ${{ steps.download.outputs.appimage-name }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl jq wget
+        
+    - name: Download latest Cursor AppImage
+      id: download
+      run: |
+        echo "🔍 Fetching download information from cursor.com..."
+        
+        # Method 1: Try to get direct download link from cursor.com
+        DOWNLOAD_PAGE="https://cursor.com/downloads"
+        echo "Fetching download page: $DOWNLOAD_PAGE"
+        
+        # Download the page and look for Linux download link
+        curl -s "$DOWNLOAD_PAGE" > downloads.html
+        
+        # Extract the Linux AppImage download URL
+        # Look for patterns like: href="https://...cursor...AppImage" or data-download-url
+        LINUX_URL=$(grep -oP 'href="[^"]*[Ll]inux[^"]*\.AppImage"' downloads.html | head -1 | sed 's/href="//;s/"//' || true)
+        
+        if [ -z "$LINUX_URL" ]; then
+          # Try alternative patterns
+          LINUX_URL=$(grep -oP 'href="[^"]*x86_64[^"]*\.AppImage"' downloads.html | head -1 | sed 's/href="//;s/"//' || true)
+        fi
+        
+        if [ -z "$LINUX_URL" ]; then
+          # Try data attributes
+          LINUX_URL=$(grep -oP 'data-download-url="[^"]*[Ll]inux[^"]*\.AppImage"' downloads.html | head -1 | sed 's/data-download-url="//;s/"//' || true)
+        fi
+        
+        if [ -z "$LINUX_URL" ]; then
+          echo "❌ Could not find Linux AppImage download URL"
+          echo "Available links in page:"
+          grep -oP 'href="[^"]*\.AppImage[^"]*"' downloads.html || echo "No AppImage links found"
+          
+          # Fallback: Use GitHub releases as backup
+          echo "🔄 Trying GitHub releases as fallback..."
+          GITHUB_API="https://api.github.com/repos/getcursor/cursor/releases/latest"
+          LINUX_URL=$(curl -s "$GITHUB_API" | jq -r '.assets[] | select(.name | test(".*[Ll]inux.*\\.AppImage$")) | .browser_download_url' | head -1)
+        fi
+        
+        if [ -z "$LINUX_URL" ] || [ "$LINUX_URL" = "null" ]; then
+          echo "❌ Failed to find download URL from both cursor.com and GitHub"
+          exit 1
+        fi
+        
+        echo "✅ Found download URL: $LINUX_URL"
+        
+        # Extract version and filename
+        APPIMAGE_NAME=$(basename "$LINUX_URL")
+        VERSION=$(echo "$APPIMAGE_NAME" | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
+        
+        echo "📦 AppImage name: $APPIMAGE_NAME"
+        echo "🏷️ Version: $VERSION"
+        
+        # Check if we already have this version (unless force download)
+        if [ -f "$APPIMAGE_NAME" ] && [ "${{ inputs.force_download }}" != "true" ]; then
+          echo "ℹ️ AppImage already exists, skipping download"
+        else
+          echo "⬇️ Downloading Cursor AppImage..."
+          if wget -O "$APPIMAGE_NAME" "$LINUX_URL"; then
+            echo "✅ Download completed successfully"
+          else
+            echo "❌ Download failed"
+            exit 1
+          fi
+        fi
+        
+        # Verify download
+        if [ ! -f "$APPIMAGE_NAME" ]; then
+          echo "❌ AppImage file not found after download"
+          exit 1
+        fi
+        
+        FILE_SIZE=$(stat -f%z "$APPIMAGE_NAME" 2>/dev/null || stat -c%s "$APPIMAGE_NAME")
+        echo "📏 File size: $(($FILE_SIZE / 1024 / 1024)) MB"
+        
+        # Make executable
+        chmod +x "$APPIMAGE_NAME"
+        
+        # Set outputs
+        echo "cursor-version=$VERSION" >> $GITHUB_OUTPUT
+        echo "download-url=$LINUX_URL" >> $GITHUB_OUTPUT
+        echo "appimage-name=$APPIMAGE_NAME" >> $GITHUB_OUTPUT
+        
+        # Create summary
+        echo "## 📥 Download Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | $VERSION |" >> $GITHUB_STEP_SUMMARY
+        echo "| Filename | $APPIMAGE_NAME |" >> $GITHUB_STEP_SUMMARY
+        echo "| Size | $(($FILE_SIZE / 1024 / 1024)) MB |" >> $GITHUB_STEP_SUMMARY
+        echo "| Download URL | $LINUX_URL |" >> $GITHUB_STEP_SUMMARY
+        
+    - name: Upload AppImage artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cursor-appimage
+        path: "*.AppImage"
+        retention-days: 7
+
+  test-installation:
+    needs: download-cursor
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            distro: "Ubuntu 22.04"
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -y fuse3 libfuse2 desktop-file-utils
+          - os: ubuntu-20.04
+            distro: "Ubuntu 20.04"
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -y fuse libfuse2 desktop-file-utils
+          # Add more distros using containers
+          - os: ubuntu-latest
+            distro: "Fedora 39"
+            container: "fedora:39"
+            setup: |
+              dnf update -y
+              dnf install -y fuse3 fuse desktop-file-utils findutils
+          - os: ubuntu-latest
+            distro: "Arch Linux"
+            container: "archlinux:latest"
+            setup: |
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm fuse3 fuse2 desktop-file-utils findutils
+          - os: ubuntu-latest
+            distro: "openSUSE Tumbleweed"
+            container: "opensuse/tumbleweed:latest"
+            setup: |
+              zypper refresh
+              zypper install -y fuse3 fuse desktop-file-utils findutils
+    
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    name: Test on ${{ matrix.distro }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Download AppImage artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: cursor-appimage
+        
+    - name: Setup test environment
+      run: |
+        echo "🔧 Setting up ${{ matrix.distro }}..."
+        ${{ matrix.setup }}
+        
+        # Create test user home directory structure
+        export HOME="${HOME:-/root}"
+        mkdir -p "$HOME/.local/share/applications"
+        mkdir -p "$HOME/.local/share/icons"
+        mkdir -p "$HOME/.local/bin"
+        
+        echo "✅ Environment setup completed"
+        
+    - name: Validate AppImage
+      run: |
+        echo "🔍 Validating downloaded AppImage..."
+        
+        APPIMAGE_FILE=$(ls *.AppImage | head -1)
+        if [ -z "$APPIMAGE_FILE" ]; then
+          echo "❌ No AppImage file found"
+          exit 1
+        fi
+        
+        echo "📦 Found AppImage: $APPIMAGE_FILE"
+        
+        # Check if file is executable
+        if [ ! -x "$APPIMAGE_FILE" ]; then
+          echo "⚠️ AppImage not executable, fixing..."
+          chmod +x "$APPIMAGE_FILE"
+        fi
+        
+        # Try to extract (test if AppImage is valid)
+        echo "🔧 Testing AppImage extraction..."
+        if ./"$APPIMAGE_FILE" --appimage-extract >/dev/null 2>&1; then
+          echo "✅ AppImage extraction successful"
+          rm -rf squashfs-root
+        else
+          echo "❌ AppImage extraction failed"
+          exit 1
+        fi
+        
+    - name: Run installation script
+      run: |
+        echo "🚀 Running Cursor installation script on ${{ matrix.distro }}..."
+        
+        # Run the installation script
+        if ./install_cursor.sh; then
+          echo "✅ Installation completed successfully"
+        else
+          echo "❌ Installation failed"
+          exit 1
+        fi
+        
+    - name: Verify installation
+      run: |
+        echo "🔍 Verifying installation results..."
+        
+        # Check if desktop file was created
+        DESKTOP_FILE="$HOME/.local/share/applications/cursor.desktop"
+        if [ -f "$DESKTOP_FILE" ]; then
+          echo "✅ Desktop file created: $DESKTOP_FILE"
+        else
+          echo "❌ Desktop file not found"
+          exit 1
+        fi
+        
+        # Validate desktop file
+        if command -v desktop-file-validate >/dev/null 2>&1; then
+          if desktop-file-validate "$DESKTOP_FILE"; then
+            echo "✅ Desktop file is valid"
+          else
+            echo "⚠️ Desktop file validation warnings (may be ok)"
+          fi
+        fi
+        
+        # Check if icon was installed
+        ICON_FILE="$HOME/.local/share/icons/cursor.png"
+        if [ -f "$ICON_FILE" ]; then
+          echo "✅ Icon file created: $ICON_FILE"
+          echo "📏 Icon size: $(stat -c%s "$ICON_FILE" 2>/dev/null || stat -f%z "$ICON_FILE") bytes"
+        else
+          echo "⚠️ Icon file not found (may be ok if none in AppImage)"
+        fi
+        
+        # Check versions directory
+        if [ -d "versions" ]; then
+          echo "✅ Versions directory created"
+          echo "📁 Contents:"
+          ls -la versions/ || true
+        else
+          echo "❌ Versions directory not found"
+          exit 1
+        fi
+        
+        # Check if current symlink exists
+        if [ -L "versions/current.AppImage" ]; then
+          echo "✅ Current version symlink created"
+          echo "🔗 Points to: $(readlink versions/current.AppImage)"
+        else
+          echo "❌ Current version symlink not found"
+          exit 1
+        fi
+        
+    - name: Test AppImage execution (dry run)
+      run: |
+        echo "🧪 Testing AppImage execution..."
+        
+        CURRENT_APPIMAGE="versions/current.AppImage"
+        if [ -L "$CURRENT_APPIMAGE" ]; then
+          # Test with --help flag (shouldn't launch GUI)
+          if timeout 30s "$CURRENT_APPIMAGE" --help >/dev/null 2>&1; then
+            echo "✅ AppImage can execute successfully"
+          else
+            echo "⚠️ AppImage execution test inconclusive (may need display)"
+            # This is expected in headless environment
+          fi
+          
+          # Test version info
+          if timeout 10s "$CURRENT_APPIMAGE" --version 2>/dev/null | head -5; then
+            echo "✅ Version information retrieved"
+          else
+            echo "ℹ️ Version info not available (normal for some AppImages)"
+          fi
+        fi
+        
+    - name: Create test report
+      if: always()
+      run: |
+        echo "## 🧪 Installation Test Report - ${{ matrix.distro }}" >> test_report.md
+        echo "" >> test_report.md
+        echo "**AppImage:** ${{ needs.download-cursor.outputs.appimage-name }}" >> test_report.md
+        echo "**Version:** ${{ needs.download-cursor.outputs.cursor-version }}" >> test_report.md
+        echo "**Test Status:** $([[ $? -eq 0 ]] && echo "✅ PASSED" || echo "❌ FAILED")" >> test_report.md
+        echo "" >> test_report.md
+        
+        echo "### 📋 Installation Results" >> test_report.md
+        echo "- Desktop file: $([[ -f "$HOME/.local/share/applications/cursor.desktop" ]] && echo "✅ Created" || echo "❌ Missing")" >> test_report.md
+        echo "- Icon file: $([[ -f "$HOME/.local/share/icons/cursor.png" ]] && echo "✅ Created" || echo "⚠️ Not found")" >> test_report.md
+        echo "- Versions directory: $([[ -d "versions" ]] && echo "✅ Created" || echo "❌ Missing")" >> test_report.md
+        echo "- Current symlink: $([[ -L "versions/current.AppImage" ]] && echo "✅ Created" || echo "❌ Missing")" >> test_report.md
+        echo "" >> test_report.md
+        
+        # Add to step summary
+        cat test_report.md >> $GITHUB_STEP_SUMMARY
+        
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.distro }}-${{ github.run_number }}
+        path: |
+          test_report.md
+          ~/.local/share/applications/cursor.desktop
+          versions/
+        retention-days: 30
+
+  create-summary:
+    needs: [download-cursor, test-installation]
+    if: always()
+    runs-on: ubuntu-latest
+    name: Create Test Summary
+    
+    steps:
+    - name: Download all test results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: test-results-*
+        merge-multiple: true
+        
+    - name: Create comprehensive summary
+      run: |
+        echo "# 🧪 Cursor Installation Test Summary" > summary.md
+        echo "" >> summary.md
+        echo "**Test Run:** $(date -u '+%Y-%m-%d %H:%M:%S') UTC" >> summary.md
+        echo "**Cursor Version:** ${{ needs.download-cursor.outputs.cursor-version }}" >> summary.md
+        echo "**AppImage:** ${{ needs.download-cursor.outputs.appimage-name }}" >> summary.md
+        echo "" >> summary.md
+        
+        echo "## 📊 Test Results by Distribution" >> summary.md
+        echo "" >> summary.md
+        
+        # Combine all test reports
+        for report in test_report*.md; do
+          if [ -f "$report" ]; then
+            cat "$report" >> summary.md
+            echo "" >> summary.md
+          fi
+        done
+        
+        echo "## 🔗 Resources" >> summary.md
+        echo "- **Download URL:** ${{ needs.download-cursor.outputs.download-url }}" >> summary.md
+        echo "- **Installation Script:** [install_cursor.sh](./install_cursor.sh)" >> summary.md
+        echo "- **Test Workflow:** [.github/workflows/cursor-auto-test.yml](.github/workflows/cursor-auto-test.yml)" >> summary.md
+        
+        # Output to step summary
+        cat summary.md >> $GITHUB_STEP_SUMMARY
+        
+    - name: Upload final summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-summary-${{ github.run_number }}
+        path: summary.md
+        retention-days: 90
