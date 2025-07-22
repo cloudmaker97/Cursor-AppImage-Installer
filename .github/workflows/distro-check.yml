@@ -37,19 +37,250 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y curl jq wget
+        sudo apt-get install -y curl jq wget python3 python3-pip
+        pip3 install playwright beautifulsoup4 requests
+        playwright install chromium
         
     - name: Download latest Cursor AppImage
       id: download
       run: |
         echo "🔍 Fetching download information from cursor.com..."
         
-        # Method 1: Try to get direct download link from cursor.com
-        DOWNLOAD_PAGE="https://cursor.com/downloads"
-        echo "Fetching download page: $DOWNLOAD_PAGE"
+        # Create Python script to handle dynamic download
+        cat > download_cursor.py << 'EOF'
+import asyncio
+from playwright.async_api import async_playwright
+import json
+import sys
+import os
+
+async def get_download_url():
+    async with async_playwright() as p:
+        try:
+            # Launch browser
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = await context.new_page()
+            
+            print("🌐 Navigating to cursor.com/downloads...")
+            await page.goto('https://cursor.com/downloads', wait_until='networkidle')
+            
+            # Wait for the page to load completely
+            await page.wait_for_timeout(3000)
+            
+            # Look for Linux download button - try multiple selectors
+            linux_selectors = [
+                'button:has-text("Linux")',
+                '[data-os="linux"]',
+                'button:has-text("x64")',
+                '.download-linux',
+                'button[data-platform="linux"]',
+                'a[href*="linux"]',
+                'a[href*="AppImage"]'
+            ]
+            
+            download_url = None
+            
+            # Try to find and click the Linux download button
+            for selector in linux_selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        print(f"✅ Found Linux button with selector: {selector}")
+                        
+                        # Set up network monitoring to catch the download URL
+                        download_urls = []
+                        
+                        def handle_response(response):
+                            url = response.url
+                            if '.AppImage' in url or ('cursor' in url.lower() and 'linux' in url.lower()):
+                                download_urls.append(url)
+                                print(f"📥 Captured download URL: {url}")
+                        
+                        page.on('response', handle_response)
+                        
+                        # Click the button
+                        await element.click()
+                        await page.wait_for_timeout(2000)
+                        
+                        if download_urls:
+                            download_url = download_urls[0]
+                            break
+                            
+                except Exception as e:
+                    print(f"❌ Selector {selector} failed: {e}")
+                    continue
+            
+            # Alternative: Try to find download URLs in network requests
+            if not download_url:
+                print("🔍 Searching for download URLs in page content...")
+                
+                # Check for any AppImage links that might be hidden
+                content = await page.content()
+                
+                # Look for patterns in the HTML
+                import re
+                appimage_pattern = r'https?://[^\s"\'<>]+\.AppImage'
+                urls = re.findall(appimage_pattern, content)
+                
+                if urls:
+                    download_url = urls[0]
+                    print(f"✅ Found AppImage URL in content: {download_url}")
+            
+            await browser.close()
+            
+            if download_url:
+                return download_url
+            else:
+                print("❌ Could not find download URL")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Browser automation failed: {e}")
+            return None
+
+# Run the async function
+download_url = asyncio.run(get_download_url())
+if download_url:
+    print(f"SUCCESS:{download_url}")
+else:
+    print("FAILED:No download URL found")
+EOF
+
+        echo "🤖 Running browser automation to get download URL..."
+        RESULT=$(python3 download_cursor.py)
         
-        # Download the page and look for Linux download link
-        curl -s "$DOWNLOAD_PAGE" > downloads.html
+        if echo "$RESULT" | grep -q "SUCCESS:"; then
+          LINUX_URL=$(echo "$RESULT" | grep "SUCCESS:" | cut -d: -f2-)
+          echo "✅ Found download URL via browser automation: $LINUX_URL"
+        else
+          echo "❌ Browser automation failed, trying API fallback..."
+          
+          # Enhanced GitHub API fallback with better error handling
+          echo "🔄 Checking GitHub releases..."
+          GITHUB_API="https://api.github.com/repos/getcursor/cursor/releases/latest"
+          
+          GITHUB_RESPONSE=$(curl -s "$GITHUB_API")
+          if echo "$GITHUB_RESPONSE" | jq -e '.assets' >/dev/null 2>&1; then
+            LINUX_URL=$(echo "$GITHUB_RESPONSE" | jq -r '.assets[]? | select(.name | test(".*[Ll]inux.*\\.AppImage$|.*x86_64.*\\.AppImage$")) | .browser_download_url' | head -1)
+            
+            if [ "$LINUX_URL" = "null" ] || [ -z "$LINUX_URL" ]; then
+              echo "🔍 Available assets:"
+              echo "$GITHUB_RESPONSE" | jq -r '.assets[]? | .name' || echo "No assets found"
+              
+              # Try broader patterns
+              LINUX_URL=$(echo "$GITHUB_RESPONSE" | jq -r '.assets[]? | select(.name | test(".*\\.AppImage$")) | .browser_download_url' | head -1)
+            fi
+          else
+            echo "❌ GitHub API response invalid"
+            echo "Response: $GITHUB_RESPONSE"
+          fi
+          
+          # Last resort: Try direct URL patterns
+          if [ "$LINUX_URL" = "null" ] || [ -z "$LINUX_URL" ]; then
+            echo "🔄 Trying known download patterns..."
+            
+            # Common cursor download patterns
+            POSSIBLE_URLS=(
+              "https://downloader.cursor.sh/linux/appImage/x64"
+              "https://download.cursor.sh/linux/appImage/x64"
+              "https://releases.cursor.com/linux/appImage/x64"
+            )
+            
+            for url in "${POSSIBLE_URLS[@]}"; do
+              echo "🧪 Testing URL: $url"
+              if curl -s -I "$url" | grep -q "200 OK"; then
+                LINUX_URL="$url"
+                echo "✅ Found working direct URL: $url"
+                break
+              fi
+            done
+          fi
+        fi
+        
+        # Final check
+        if [ -z "$LINUX_URL" ] || [ "$LINUX_URL" = "null" ]; then
+          echo "❌ All download methods failed"
+          echo "🆘 Manual intervention required - please check cursor.com/downloads"
+          exit 1
+        fi
+        
+        echo "✅ Final download URL: $LINUX_URL"
+        
+        # Extract version and filename
+        APPIMAGE_NAME=$(basename "$LINUX_URL" | sed 's/?.*$//')
+        if [ -z "$APPIMAGE_NAME" ] || [ "$APPIMAGE_NAME" = "/" ]; then
+          # Generate filename if we can't extract it
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          APPIMAGE_NAME="Cursor-${TIMESTAMP}-x86_64.AppImage"
+        fi
+        
+        VERSION=$(echo "$APPIMAGE_NAME" | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
+        
+        echo "📦 AppImage name: $APPIMAGE_NAME"
+        echo "🏷️ Version: $VERSION"
+        
+        # Check if we already have this version (unless force download)
+        if [ -f "$APPIMAGE_NAME" ] && [ "${{ inputs.force_download }}" != "true" ]; then
+          echo "ℹ️ AppImage already exists, skipping download"
+        else
+          echo "⬇️ Downloading Cursor AppImage..."
+          
+          # Download with better error handling
+          if wget --progress=bar:force:noscroll --timeout=300 --tries=3 -O "$APPIMAGE_NAME" "$LINUX_URL"; then
+            echo "✅ Download completed successfully"
+          else
+            echo "❌ Download failed with wget, trying curl..."
+            if curl -L --progress-bar --max-time 300 --retry 3 -o "$APPIMAGE_NAME" "$LINUX_URL"; then
+              echo "✅ Download completed with curl"
+            else
+              echo "❌ All download attempts failed"
+              exit 1
+            fi
+          fi
+        fi
+        
+        # Verify download
+        if [ ! -f "$APPIMAGE_NAME" ]; then
+          echo "❌ AppImage file not found after download"
+          exit 1
+        fi
+        
+        FILE_SIZE=$(stat -c%s "$APPIMAGE_NAME" 2>/dev/null || stat -f%z "$APPIMAGE_NAME" 2>/dev/null || echo "0")
+        if [ "$FILE_SIZE" -lt 10000000 ]; then  # Less than 10MB is suspicious
+          echo "⚠️ Downloaded file seems too small ($FILE_SIZE bytes)"
+          echo "File content preview:"
+          head -20 "$APPIMAGE_NAME" || true
+        fi
+        
+        echo "📏 File size: $(($FILE_SIZE / 1024 / 1024)) MB"
+        
+        # Make executable
+        chmod +x "$APPIMAGE_NAME"
+        
+        # Test if it's a valid AppImage
+        if ./"$APPIMAGE_NAME" --appimage-extract >/dev/null 2>&1; then
+          echo "✅ AppImage validation successful"
+          rm -rf squashfs-root
+        else
+          echo "⚠️ AppImage validation failed (might still work)"
+        fi
+        
+        # Set outputs
+        echo "cursor-version=$VERSION" >> $GITHUB_OUTPUT
+        echo "download-url=$LINUX_URL" >> $GITHUB_OUTPUT
+        echo "appimage-name=$APPIMAGE_NAME" >> $GITHUB_OUTPUT
+        
+        # Create summary
+        echo "## 📥 Download Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | $VERSION |" >> $GITHUB_STEP_SUMMARY
+        echo "| Filename | $APPIMAGE_NAME |" >> $GITHUB_STEP_SUMMARY
+        echo "| Size | $(($FILE_SIZE / 1024 / 1024)) MB |" >> $GITHUB_STEP_SUMMARY
+        echo "| Download URL | $LINUX_URL |" >> $GITHUB_STEP_SUMMARYOAD_PAGE" > downloads.html
         
         # Extract the Linux AppImage download URL
         # Look for patterns like: href="https://...cursor...AppImage" or data-download-url
