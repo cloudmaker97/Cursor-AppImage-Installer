@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# shellcheck disable=SC2034  # Unused variables are used in log functions
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 # Configuration
@@ -70,7 +71,10 @@ main() {
     
     # Extract to get desktop file and icon
     log_info "Extracting AppImage to get desktop file and icon..."
-    ./"$appimage_name" --appimage-extract >/dev/null 2>&1
+    if ! ./"$appimage_name" --appimage-extract >/dev/null 2>&1; then
+        log_error "Failed to extract AppImage"
+        exit 1
+    fi
     
     # Create directories
     mkdir -p "$APPLICATIONS_DIR"
@@ -150,7 +154,7 @@ EOF
     
     if [[ -z "$icon_source" ]]; then
         # Look for any icon files
-        local icon_files=($(find squashfs-root -name "*.png" -o -name "*.svg" -o -name "*.ico" 2>/dev/null | head -5))
+        mapfile -t icon_files < <(find squashfs-root -name "*.png" -o -name "*.svg" -o -name "*.ico" 2>/dev/null | head -5)
         if [[ ${#icon_files[@]} -gt 0 ]]; then
             icon_source="${icon_files[0]}"
             log_warn "Using icon file: $icon_source"
@@ -220,16 +224,24 @@ EOF
     
     # Create a symlink to the current version for easy access
     local current_symlink="$VERSIONS_DIR/current.AppImage"
-    [[ -L "$current_symlink" || -f "$current_symlink" ]] && rm "$current_symlink"
+    if [[ -L "$current_symlink" ]] || [[ -f "$current_symlink" ]]; then
+        rm "$current_symlink"
+    fi
     ln -s "$(basename "$versioned_path")" "$current_symlink"
     
     # Clean up extracted files
     log_info "Cleaning up..."
-    rm -rf squashfs-root
-    [[ -f "basic_cursor.desktop" ]] && rm "basic_cursor.desktop"
+    if [[ -d "squashfs-root" ]]; then
+        rm -rf "./squashfs-root"
+    fi
+    if [[ -f "basic_cursor.desktop" ]]; then
+        rm "./basic_cursor.desktop"
+    fi
     
     # Update desktop database if available
-    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
+    fi
     
     # Summary
     echo ""
@@ -237,7 +249,9 @@ EOF
     log_info "- AppImage moved to: $versioned_path"
     log_info "- Current version symlink: $current_symlink"
     log_info "- Desktop entry: $desktop_dest"
-    [[ -n "$icon_dest" ]] && log_info "- Icon installed to: $icon_dest"
+    if [[ -n "$icon_dest" ]]; then
+        log_info "- Icon installed to: $icon_dest"
+    fi
     log_info "- You can now launch Cursor from your application menu"
     echo ""
     log_info "Version management:"
@@ -246,11 +260,12 @@ EOF
     log_info "- To manage versions, check the $VERSIONS_DIR directory"
     
     # Show existing versions
-    local version_count=$(ls -1 "$VERSIONS_DIR"/*.AppImage 2>/dev/null | wc -l)
+    local version_count
+    version_count=$(find "$VERSIONS_DIR" -name "*.AppImage" -not -name "current.AppImage" 2>/dev/null | wc -l)
     if [[ $version_count -gt 1 ]]; then
         echo ""
         log_info "Existing versions:"
-        ls -la "$VERSIONS_DIR"/*.AppImage 2>/dev/null | sed 's/^/  /'
+        find "$VERSIONS_DIR" -name "*.AppImage" -not -name "current.AppImage" -exec ls -la {} \; 2>/dev/null | sed 's/^/  /'
     fi
     
     # FUSE troubleshooting hint
