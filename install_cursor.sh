@@ -1,18 +1,20 @@
 #!/bin/bash
 
-# shellcheck disable=SC2034  # Unused variables are used in log functions
-set -euo pipefail  # Exit on error, undefined vars, pipe failures
+# Cursor AppImage Installer with Desktop Integration and Version Management
+# shellcheck disable=SC2034  # Color variables used in functions
+
+set -euo pipefail # Exit on error, undefined vars, pipe failures
 
 # Configuration
-DESKTOP_FILE_NAME="cursor.desktop"
-APPLICATIONS_DIR="$HOME/.local/share/applications"
-VERSIONS_DIR="versions"
+readonly DESKTOP_FILE_NAME="cursor.desktop"
+readonly APPLICATIONS_DIR="$HOME/.local/share/applications"
+readonly VERSIONS_DIR="versions"
 
 # Colors
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+readonly GREEN='\033[0;32m'
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m'
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -32,7 +34,7 @@ check_appimage() {
     shopt -s nullglob
     local appimages=(*.AppImage)
     shopt -u nullglob
-    
+
     if [[ ${#appimages[@]} -eq 0 ]]; then
         echo ""
         log_error "No AppImage files found in current directory"
@@ -42,90 +44,55 @@ check_appimage() {
         echo "Current directory: $(pwd)"
         echo ""
         echo "Available files:"
-        ls -la . | grep -v "^d" | tail -n +2 || echo "  (no files found)"
+        # Use find instead of ls | grep for better file handling
+        if ! find . -maxdepth 1 -type f -not -name ".*" -exec ls -la {} \; 2>/dev/null | head -10; then
+            echo "  (no files found)"
+        fi
         exit 1
     fi
-    
+
     if [[ ${#appimages[@]} -gt 1 ]]; then
         log_warn "Multiple AppImage files found. Using: ${appimages[0]}"
         log_warn "Found files: ${appimages[*]}"
     fi
-    
+
     # Return the first AppImage found
     echo "${appimages[0]}"
 }
 
-# Main installation process
-main() {
-    local current_dir="$(pwd)"
-    
-    # Check for AppImage and get the filename
-    local appimage_name
-    appimage_name=$(check_appimage)
-    
-    log_info "Found AppImage: $appimage_name"
-    
-    # Make AppImage executable
-    log_info "Making AppImage executable..."
-    chmod +x "$appimage_name"
-    
-    # Extract to get desktop file and icon
-    log_info "Extracting AppImage to get desktop file and icon..."
-    if ! ./"$appimage_name" --appimage-extract >/dev/null 2>&1; then
-        log_error "Failed to extract AppImage"
-        exit 1
-    fi
-    
-    # Create directories
-    mkdir -p "$APPLICATIONS_DIR"
-    mkdir -p "$VERSIONS_DIR"
-    
-    # Find desktop file
+# Find desktop file in extracted AppImage
+find_desktop_file() {
     local desktop_source=""
-    local possible_desktop_locations=(
+    local -a possible_desktop_locations=(
         "squashfs-root/cursor.desktop"
         "squashfs-root/usr/share/applications/cursor.desktop"
         "squashfs-root/share/applications/cursor.desktop"
     )
-    
+
     for location in "${possible_desktop_locations[@]}"; do
         if [[ -f "$location" ]]; then
             desktop_source="$location"
             break
         fi
     done
-    
+
     if [[ -z "$desktop_source" ]]; then
         # Look for any .desktop file
-        local desktop_files=(squashfs-root/*.desktop squashfs-root/**/applications/*.desktop)
-        for file in "${desktop_files[@]}"; do
-            if [[ -f "$file" ]]; then
-                desktop_source="$file"
-                log_warn "Using desktop file: $file"
-                break
-            fi
-        done
+        local desktop_files
+        mapfile -t desktop_files < <(find squashfs-root -name "*.desktop" -type f 2>/dev/null)
+        if [[ ${#desktop_files[@]} -gt 0 ]]; then
+            desktop_source="${desktop_files[0]}"
+            log_warn "Using desktop file: $desktop_source"
+        fi
     fi
-    
-    # If no desktop file found, create a basic one
-    if [[ -z "$desktop_source" ]]; then
-        log_warn "No desktop file found - creating a basic one"
-        desktop_source="basic_cursor.desktop"
-        cat > "$desktop_source" << 'EOF'
-[Desktop Entry]
-Name=Cursor
-Comment=AI-first Code Editor
-Exec=placeholder
-Icon=cursor
-Type=Application
-Categories=Development;TextEditor;
-StartupWMClass=Cursor
-EOF
-    fi
-    
-    # Find icon file
+
+    echo "$desktop_source"
+}
+
+# Find icon file in extracted AppImage
+find_icon_file() {
     local icon_source=""
-    local possible_icons=(
+    local -a possible_icons=(
         "squashfs-root/co.anysphere.cursor.png"
         "squashfs-root/cursor.png"
         "squashfs-root/resources/app/build/icon.png"
@@ -136,7 +103,7 @@ EOF
         "squashfs-root/icon.png"
         "squashfs-root/app.png"
     )
-    
+
     for icon in "${possible_icons[@]}"; do
         if [[ -f "$icon" ]]; then
             icon_source="$icon"
@@ -144,42 +111,25 @@ EOF
             break
         fi
     done
-    
-    for icon in "${possible_icons[@]}"; do
-        if [[ -f "$icon" ]]; then
-            icon_source="$icon"
-            break
-        fi
-    done
-    
+
     if [[ -z "$icon_source" ]]; then
         # Look for any icon files
+        local icon_files
         mapfile -t icon_files < <(find squashfs-root -name "*.png" -o -name "*.svg" -o -name "*.ico" 2>/dev/null | head -5)
         if [[ ${#icon_files[@]} -gt 0 ]]; then
             icon_source="${icon_files[0]}"
             log_warn "Using icon file: $icon_source"
         fi
     fi
-    
-    # Move AppImage to versions directory
-    local version_timestamp=$(date +"%Y%m%d_%H%M%S")
-    local appimage_basename=$(basename "$appimage_name" .AppImage)
-    local versioned_name="${appimage_basename}_${version_timestamp}.AppImage"
-    local versioned_path="$VERSIONS_DIR/$versioned_name"
-    
-    log_info "Moving AppImage to versions directory..."
-    mv "$appimage_name" "$versioned_path"
-    
-    # Get absolute paths
-    local appimage_full_path="$current_dir/$versioned_path"
-    local desktop_dest="$APPLICATIONS_DIR/$DESKTOP_FILE_NAME"
-    
-    # Copy desktop file
-    log_info "Installing desktop entry..."
-    cp "$desktop_source" "$desktop_dest"
-    
-    # Copy icon to a permanent location
+
+    echo "$icon_source"
+}
+
+# Install icon to permanent location
+install_icon() {
+    local icon_source="$1"
     local icon_dest=""
+
     if [[ -n "$icon_source" ]]; then
         local icon_dir="$HOME/.local/share/icons"
         mkdir -p "$icon_dir"
@@ -188,7 +138,7 @@ EOF
         cp "$icon_source" "$icon_dest"
         log_info "Icon copied from: $icon_source"
         log_info "Icon installed to: $icon_dest"
-        
+
         # Verify icon was copied successfully
         if [[ -f "$icon_dest" ]]; then
             log_info "Icon installation verified ✓"
@@ -198,10 +148,40 @@ EOF
     else
         log_warn "No icon found in AppImage"
     fi
-    
+
+    echo "$icon_dest"
+}
+
+# Create or update desktop file
+create_desktop_file() {
+    local desktop_source="$1"
+    local appimage_full_path="$2"
+    local icon_dest="$3"
+    local desktop_dest="$APPLICATIONS_DIR/$DESKTOP_FILE_NAME"
+
+    # If no desktop file found, create a basic one
+    if [[ -z "$desktop_source" ]]; then
+        log_warn "No desktop file found - creating a basic one"
+        desktop_source="basic_cursor.desktop"
+        cat >"$desktop_source" <<'EOF'
+[Desktop Entry]
+Name=Cursor
+Comment=AI-first Code Editor
+Exec=placeholder
+Icon=cursor
+Type=Application
+Categories=Development;TextEditor;
+StartupWMClass=Cursor
+EOF
+    fi
+
+    # Copy desktop file
+    log_info "Installing desktop entry..."
+    cp "$desktop_source" "$desktop_dest"
+
     # Update desktop file with correct paths and add sandbox flag
     sed -i "s|Exec=.*|Exec=\"$appimage_full_path\" --no-sandbox|g" "$desktop_dest"
-    
+
     if [[ -n "$icon_dest" ]]; then
         # Don't add quotes around the icon path - desktop files don't need them
         sed -i "s|Icon=.*|Icon=$icon_dest|g" "$desktop_dest"
@@ -211,38 +191,108 @@ EOF
         sed -i "/^Icon=/d" "$desktop_dest"
         log_warn "No icon found - removed Icon line from desktop file"
     fi
-    
+
+    # Make desktop file executable
+    chmod +x "$desktop_dest"
+
     # Show the final desktop file content for verification
     echo ""
     log_info "Final desktop file content:"
     echo "─────────────────────────────────────"
     cat "$desktop_dest"
     echo "─────────────────────────────────────"
-    
-    # Make desktop file executable
-    chmod +x "$desktop_dest"
-    
+
+    echo "$desktop_dest"
+}
+
+# Clean up temporary files
+cleanup_files() {
+    log_info "Cleaning up..."
+    if [[ -d "squashfs-root" ]]; then
+        rm -rf ./squashfs-root
+    fi
+    if [[ -f "basic_cursor.desktop" ]]; then
+        rm ./basic_cursor.desktop
+    fi
+}
+
+# Main installation process
+main() {
+    local current_dir
+    local appimage_name
+    local desktop_source
+    local icon_source
+    local version_timestamp
+    local appimage_basename
+    local versioned_name
+    local versioned_path
+    local appimage_full_path
+    local icon_dest
+    local desktop_dest
+    local current_symlink
+    local version_count
+
+    current_dir="$(pwd)"
+
+    # Check for AppImage and get the filename
+    appimage_name=$(check_appimage)
+
+    log_info "Found AppImage: $appimage_name"
+
+    # Make AppImage executable
+    log_info "Making AppImage executable..."
+    chmod +x "$appimage_name"
+
+    # Extract to get desktop file and icon
+    log_info "Extracting AppImage to get desktop file and icon..."
+    if ! ./"$appimage_name" --appimage-extract >/dev/null 2>&1; then
+        log_error "Failed to extract AppImage"
+        exit 1
+    fi
+
+    # Create directories
+    mkdir -p "$APPLICATIONS_DIR"
+    mkdir -p "$VERSIONS_DIR"
+
+    # Find desktop file
+    desktop_source=$(find_desktop_file)
+
+    # Find icon file
+    icon_source=$(find_icon_file)
+
+    # Move AppImage to versions directory
+    version_timestamp=$(date +"%Y%m%d_%H%M%S")
+    appimage_basename=$(basename "$appimage_name" .AppImage)
+    versioned_name="${appimage_basename}_${version_timestamp}.AppImage"
+    versioned_path="$VERSIONS_DIR/$versioned_name"
+
+    log_info "Moving AppImage to versions directory..."
+    mv "$appimage_name" "$versioned_path"
+
+    # Get absolute paths
+    appimage_full_path="$current_dir/$versioned_path"
+
+    # Install icon
+    icon_dest=$(install_icon "$icon_source")
+
+    # Create desktop file
+    desktop_dest=$(create_desktop_file "$desktop_source" "$appimage_full_path" "$icon_dest")
+
     # Create a symlink to the current version for easy access
-    local current_symlink="$VERSIONS_DIR/current.AppImage"
+    current_symlink="$VERSIONS_DIR/current.AppImage"
     if [[ -L "$current_symlink" ]] || [[ -f "$current_symlink" ]]; then
         rm "$current_symlink"
     fi
     ln -s "$(basename "$versioned_path")" "$current_symlink"
-    
+
     # Clean up extracted files
-    log_info "Cleaning up..."
-    if [[ -d "squashfs-root" ]]; then
-        rm -rf "./squashfs-root"
-    fi
-    if [[ -f "basic_cursor.desktop" ]]; then
-        rm "./basic_cursor.desktop"
-    fi
-    
+    cleanup_files
+
     # Update desktop database if available
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
     fi
-    
+
     # Summary
     echo ""
     log_info "Installation completed successfully!"
@@ -258,16 +308,15 @@ EOF
     log_info "- All versions are stored in: $VERSIONS_DIR/"
     log_info "- Current version points to: $versioned_name"
     log_info "- To manage versions, check the $VERSIONS_DIR directory"
-    
+
     # Show existing versions
-    local version_count
     version_count=$(find "$VERSIONS_DIR" -name "*.AppImage" -not -name "current.AppImage" 2>/dev/null | wc -l)
     if [[ $version_count -gt 1 ]]; then
         echo ""
         log_info "Existing versions:"
         find "$VERSIONS_DIR" -name "*.AppImage" -not -name "current.AppImage" -exec ls -la {} \; 2>/dev/null | sed 's/^/  /'
     fi
-    
+
     # FUSE troubleshooting hint
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
