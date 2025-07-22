@@ -15,10 +15,11 @@ A simple bash script to install Cursor AI Code Editor AppImages on Linux with pr
 
 1. **Download the installer script**
 
-First navigate to the directory where you want to keep your cursor installation tool and the software versions (e.g. ~/Documents/Tools)
+First navigate to the directory where you want to keep your cursor installation tool and the software versions (e.g. ~/Tools/Cursor)
 
    ```bash
-   curl -O https://raw.githubusercontent.com/your-repo/cursor-installer/main/install_cursor.sh
+   mkdir ~/Tools/Cursor -p && cd ~/Tools/Cursor
+   curl -O https://raw.githubusercontent.com/cloudmaker97/Cursor-AppImage-Installer/main/install_cursor.sh
    chmod +x install_cursor.sh
    ```
 
